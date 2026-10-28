@@ -1,0 +1,121 @@
+name: hrmsystem
+
+# ------------------------------------------------------------------------------
+#  HrmSystem — Docker Compose (Phase 1)
+#  Services:
+#    hrmsystem.api        → ASP.NET Core API (REST + SignalR, health-checked)
+#    hrmsystem.client     → Blazor WASM behind nginx (proxies /api + /hubs → api)
+#    hrmsystem.sqlserver  → SQL Server 2022 (data + backups volumes, healthcheck)
+#    hrmsystem.redis      → Redis cache
+#    hrmsystem.seq        → Seq log/trace sink (OTLP ingest on 5341)
+#  Full stack:  docker compose up -d --build   →  browse https://localhost:5100
+# ------------------------------------------------------------------------------
+
+services:
+  hrmsystem.api:
+    container_name: hrmsystem.api
+    build:
+      context: .
+      dockerfile: src/Web/HrmSystem.Web/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Development"   #! Development = full Bogus demo seed. Use Production for config-only seeding.
+      ASPNETCORE_URLS: "http://+:8080"
+      #! Credentials come from .env (gitignored) — copy .env.example to .env first.
+      ConnectionStrings__Database: "Server=hrmsystem.sqlserver,1433;Database=HrmSystem;User Id=sa;Password=${MSSQL_SA_PASSWORD};TrustServerCertificate=True;"
+      Jwt__Key: "${JWT_KEY}"
+      ConnectionStrings__RedisCache: "hrmsystem.redis:6379"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://hrmsystem.seq:5341/ingest/otlp"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf"
+    ports:
+      - "5000:8080"
+    volumes:
+      #! Same named volume SQL Server writes backups into — BackupFreshness check + restore drills read it.
+      - sqlserver_backups:/var/backups
+    healthcheck:
+      #! The aspnet base image ships neither curl nor wget — bash /dev/tcp is the probe.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8080 && printf 'GET /health HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '200' <&3"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+    depends_on:
+      hrmsystem.sqlserver:
+        condition: service_healthy
+      hrmsystem.redis:
+        condition: service_started
+      hrmsystem.seq:
+        condition: service_started
+
+  hrmsystem.client:
+    container_name: hrmsystem.client
+    build:
+      context: .
+      dockerfile: src/Client/HrmSystem.Client/Dockerfile
+    ports:
+      #? HTTPS origin — nginx terminates TLS with a self-signed cert baked into the image.
+      - "5100:443"
+      #? Plain HTTP — nginx 301-redirects to https://localhost:5100.
+      - "5180:80"
+    depends_on:
+      hrmsystem.api:
+        condition: service_healthy
+  #! One-shot startup task: a fresh named volume is created root-owned and SQL
+  #! Server (uid 10001) cannot write BACKUPs into it ("Operating system error 5 —
+  #! Access denied"), so fix the ownership before SQL Server ever starts.
+  hrmsystem.backup-perms:
+    container_name: hrmsystem.backup-perms
+    image: alpine:3
+    command: sh -c "chown 10001:10001 /var/backups && chmod 755 /var/backups"
+    volumes:
+      - sqlserver_backups:/var/backups
+    restart: "no"
+
+  hrmsystem.sqlserver:
+    container_name: hrmsystem.sqlserver
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD}"
+      MSSQL_PID: "Developer"
+    ports:
+      - "14330:1433"
+    volumes:
+      - sqlserver_data:/var/opt/mssql
+      #! The DR-critical volume — DatabaseBackupJob writes .bak files here (shared with the API).
+      - sqlserver_backups:/var/backups
+    depends_on:
+      hrmsystem.backup-perms:
+        condition: service_completed_successfully
+    healthcheck:
+      #! -C trusts the self-signed certificate inside the container (mssql-tools18 enforces TLS).
+      test: /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -Q "SELECT 1" -b -C
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 60s
+
+  hrmsystem.redis:
+    container_name: hrmsystem.redis
+    image: redis:latest
+    ports:
+      - "63790:6379"
+
+  hrmsystem.seq:
+    container_name: hrmsystem.seq
+    image: datalust/seq:latest
+    environment:
+      ACCEPT_EULA: "Y"
+      #! Dev-only: newer Seq images refuse to start without a first-run auth decision.
+      SEQ_FIRSTRUN_NOAUTHENTICATION: "true"
+    ports:
+      #? UI on http://localhost:8081 — OTLP ingest (traces/logs from the API) on 5341.
+      - "8082:80"
+      - "5342:5341"
+    volumes:
+      - seq_data:/data
+
+volumes:
+  sqlserver_data:
+  #! Named volume so backups survive container recreation — see docs/disaster-recovery-runbook.md.
+  sqlserver_backups:
+  seq_data:
